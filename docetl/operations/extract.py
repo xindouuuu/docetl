@@ -290,6 +290,13 @@ Do not include explanatory text in your response, only the JSON object.
                 start_line = line_range.get("start_line", 0)
                 end_line = line_range.get("end_line", 0)
 
+                # An end_line past EOF is an off-by-a-few estimate on a long
+                # section, not a malformed range: the intent is unambiguous, so
+                # clamp instead of discarding the whole extraction. Genuinely
+                # malformed ranges still fall through to skip_on_error below.
+                if 1 <= start_line <= len(lines) and end_line > len(lines):
+                    end_line = len(lines)
+
                 # Validate line numbers
                 if start_line < 1 or end_line < start_line or end_line > len(lines):
                     if self.config.get("skip_on_error", True):
