@@ -115,12 +115,106 @@ _BOILERPLATE = [
 ]
 
 
+def explode_tables(t: str) -> str:
+    """Put each table row on its own line.
+
+    `extract` works at LINE granularity, but MinerU emits a whole <table> as a
+    single line -- on these forms that is 26-43% of the characters packed into
+    8-10 lines, with the longest line running to ~3,900 characters. A form
+    section living inside one <td> therefore cannot be cut at its boundary, and
+    the extraction picks up the neighbouring question's text.
+
+    Breaking after each </tr> gives one logical row per line. Measured on the
+    five forms: longest line 3,976 -> 1,827 chars.
+    """
+    t = re.sub(r"(<table[^>]*>)", r"\n\1\n", t)
+    t = re.sub(r"(</tr>)", r"\1\n", t)
+    t = re.sub(r"(</table>)", r"\n\1\n", t)
+    return re.sub(r"\n{3,}", "\n\n", t)
+
+
+# ── section routing: MEASURED, REJECTED ───────────────────────────
+#
+# Kept for the record because the result is counter-intuitive. Feeding each op
+# only its own slice of the form cuts input characters by 41%, and it still
+# made the pipeline WORSE: $0.59 -> $1.25 for the same 5 documents, with
+# coverage down 54.3% -> 53.1%.
+#
+# The cause is the thinking model. Isolating one question strips the context
+# it uses to locate that question's boundaries, so it deliberates instead.
+# Measured on the "Plans" question of 2025-153, same prompt and model:
+#
+#     slice   (1,452 chars)   1,041 prompt tok    725 completion tok   1,279 chars out
+#     section (10,907 chars)  5,571 prompt tok    240 completion tok   1,426 chars out
+#
+# Output tokens cost ~8x input on Gemini, so 3x the reasoning erases the input
+# saving -- and the narrow slice extracted LESS text. Cost on this workload is
+# not driven by how much you feed the model but by how hard it has to think;
+# `split_sections` is therefore unused. A cheaper non-reasoning model for the
+# mechanical ops is the lever that would actually work.
+#
+# ── original note ────────────────────────────────────────────────
+#
+# Every op used to receive the whole document, so input tokens scaled with
+# op count (12 LLM ops x ~7k tokens). The form is rigidly structured, so the
+# slice each op needs can be cut deterministically. Splitting only at the
+# Roman-numeral sections saves 22%; splitting Section IV per NUMBERED QUESTION
+# is what actually pays, because 9 of the 12 ops live inside Section IV.
+#
+# Every slice falls back to a wider one when its marker is absent, so a form
+# generation this does not recognise degrades to the old behaviour (more
+# expensive, same result) instead of extracting from an empty string.
+
+_Q_TITLES = [
+    ("q_overview", r"Overview"),
+    ("q_novelty", r"Novelty\s*&\s*Unobviousness"),
+    ("q_limitations", r"Limitations"),
+    ("q_prior_art", r"Prior\s*Art"),
+    ("q_commercial_apps", r"Commercial\s*Applications"),
+    ("q_commercial_interest", r"Commercial\s*Interest"),
+    ("q_plans", r"Plans"),
+    ("q_trl", r"Technology\s*Readiness\s*Level"),
+    ("q_material", r"Material"),
+    ("q_technical", r"Technical\s*Description"),
+]
+_Q_PAT = re.compile(
+    r"(?:^|<td[^>]*>|\n)\s*(\d{1,2})\s*\.\s*("
+    + "|".join(p for _, p in _Q_TITLES) + r")\b",
+    re.I | re.M,
+)
+
+
+def split_sections(body: str) -> dict:
+    inv = re.search(r"III[-\s]?A\.?\s*NUS\s+INVENTORS", body, re.I)
+    det = re.search(r"(?:IV\.\s*)?DETAILS\s+OF\s+THE\s+INVENTION", body, re.I)
+    i = inv.start() if inv else None
+    d = det.start() if det and (not i or det.start() > i) else None
+
+    out = {
+        "sec_head": body[:i] if i else body,
+        "sec_inventors": body[i:d] if i and d else (body[i:] if i else body),
+        "sec_details": body[d:] if d else body,
+    }
+
+    hits = [(m.start(), m.group(2)) for m in _Q_PAT.finditer(out["sec_details"])]
+    found = {}
+    for n, (pos, title) in enumerate(hits):
+        end = hits[n + 1][0] if n + 1 < len(hits) else len(out["sec_details"])
+        key = next(k for k, pat in _Q_TITLES if re.fullmatch(pat, title, re.I))
+        found.setdefault(key, out["sec_details"][pos:end])
+    for key, _ in _Q_TITLES:
+        out[key] = found.get(key) or out["sec_details"]
+    return out
+
+
 def strip_boilerplate(doc: dict) -> dict:
     t = doc["text"]
     for pattern in _BOILERPLATE:
         t = re.sub(pattern, "", t, flags=re.S)
+    t = explode_tables(t)
     t = re.sub(r"\n{3,}", "\n\n", t)
-    out = {"body": t.strip(), "orig_len": len(doc["text"]), "body_len": len(t)}
+    t = t.strip()
+    out = {"body": t, "orig_len": len(doc["text"]), "body_len": len(t)}
     if "pdf_path" in doc:
         out["pdf_path"] = doc["pdf_path"]
     return out
@@ -128,8 +222,18 @@ def strip_boilerplate(doc: dict) -> dict:
 
 # ── 3. extraction ops ──────────────────────────────────────────────
 
-def build(frame: docetl.Frame) -> docetl.Frame:
-    frame = frame.code_map(name="preprocess", code=strip_boilerplate)
+def build(frame: docetl.Frame, *, preprocess: bool = True) -> docetl.Frame:
+    """Assemble the op DAG.
+
+    ``preprocess=False`` omits the code_map and expects `body` to already be
+    on each row. MOAR serializes the pipeline to YAML to search over it, and a
+    `code` op holding a Python function object cannot round-trip through
+    yaml.safe_load -- so the deterministic preprocessing is applied up front
+    for optimizer runs. Nothing is lost: there is nothing in a fixed regex for
+    an optimizer to improve.
+    """
+    if preprocess:
+        frame = frame.code_map(name="preprocess", code=strip_boilerplate)
 
     # --- 3a. form identity / metadata -------------------------------
     frame = frame.map(
@@ -364,20 +468,13 @@ manufacturing"). [] if not explicitly stated.""",
         prompt=GROUNDING
         + """
 
-Extract the shorter narrative answers from Section IV, DETAILS OF THE INVENTION.
+Extract the remaining narrative answers from Section IV, DETAILS OF THE
+INVENTION. All four of these are normally ABSENT on this form -- the form has
+no dedicated box for any of them -- so "" is the expected answer unless the
+text really does state them separately.
 
 {{ input.body }}
 
-- novelty_and_advantages: the "Novelty & Unobviousness" answer (Q17 v3-era /
-  Q18 v5+). It is a Feature | Benefit/Advantage table -- render it as text
-  PRESERVING THE PAIRING, one "Feature -- Benefit" per line.
-- limitations: the "Limitations" answer (Q18 v3-era / Q19 v5+), verbatim.
-- commercial_applications: the "Commercial Applications" answer (Q20 v3-era /
-  Q21 v5+) -- the critical commercial problems this invention solves. Verbatim.
-  This is DISTINCT from "Commercial Interest" (the table of interested
-  companies).
-- plans: the "Plans" answer (Q22 v3-era / Q23 v5+) -- who is working on it,
-  further research, grants being applied for, commercialisation path. Verbatim.
 - background: the problem/context motivating the invention, ONLY if stated
   separately from the Overview. On this form it is usually embedded inside the
   Overview -> "" .
@@ -389,10 +486,6 @@ Extract the shorter narrative answers from Section IV, DETAILS OF THE INVENTION.
   separately from Overview / Commercial Applications -> usually "".""",
         output={
             "schema": {
-                "novelty_and_advantages": "string",
-                "limitations": "string",
-                "commercial_applications": "string",
-                "plans": "string",
                 "background": "string",
                 "drawings_description": "string",
                 "modifications": "string",
@@ -436,6 +529,68 @@ question at all -- if there is none, extract nothing.""",
     )
 
     frame = frame.extract(
+        name="novelty",
+        prompt="""Extract the complete "Novelty & Unobviousness" answer -- the
+question listing the features that make this invention a substantial
+improvement over existing technology, with the unique benefits or advantages
+each feature provides (numbered 17 on v3-era forms, 18 on v5+ forms).
+
+This answer is a two-column table: Feature | Benefit/Advantage. Extract the
+ENTIRE table including its header row and every feature/benefit pair, so the
+pairing is preserved. Start at the table and stop before the next numbered
+question ("Limitations"). Do not include the question text itself. If the
+table is empty or only placeholder text, extract nothing.""",
+        document_keys=["body"],
+        skip_on_error=True,
+        bypass_cache=BYPASS_EXTRACT,
+    )
+
+    frame = frame.extract(
+        name="limitations",
+        prompt="""Extract the complete "Limitations" answer -- the question asking
+for the limitations of this invention in terms of scalability, speed, power
+consumption, efficiency, use of exotic compounds and so on (numbered 18 on
+v3-era forms, 19 on v5+ forms).
+
+Extract the full answer body only, stopping before the next numbered question
+("Prior Art"). Do not include the question text itself. If the answer is
+blank, "NA", or only placeholder text, extract nothing.""",
+        document_keys=["body"],
+        skip_on_error=True,
+        bypass_cache=BYPASS_EXTRACT,
+    )
+
+    frame = frame.extract(
+        name="commercial",
+        prompt="""Extract the complete "Commercial Applications" answer -- the
+question asking what critical commercial problems this invention solves
+(numbered 20 on v3-era forms, 21 on v5+ forms).
+
+This is DISTINCT from "Commercial Interest", which is a table of interested
+companies -- do not extract that one. Extract the full answer body only,
+stopping before the next numbered question. Do not include the question text
+itself. If blank or "NA", extract nothing.""",
+        document_keys=["body"],
+        skip_on_error=True,
+        bypass_cache=BYPASS_EXTRACT,
+    )
+
+    frame = frame.extract(
+        name="plans",
+        prompt="""Extract the complete "Plans" answer -- the question asking about
+plans regarding this invention: who is working on it, what further research is
+planned, what grants are being applied for, the commercialisation path
+(numbered 22 on v3-era forms, 23 on v5+ forms).
+
+Extract the full answer body only, stopping before the next numbered question
+("Technology Readiness Level"). Do not include the question text itself. If
+blank or "NA", extract nothing.""",
+        document_keys=["body"],
+        skip_on_error=True,
+        bypass_cache=BYPASS_EXTRACT,
+    )
+
+    frame = frame.extract(
         name="technical",
         prompt="""Extract the complete "Technical Description" answer -- the final
 and longest question, asking for full technical details roughly corresponding
@@ -468,6 +623,43 @@ _PLACEHOLDER = re.compile(
     r"write here|please include again the title|should be distinguishable in black",
     re.I,
 )
+
+
+# `extract` cuts at LINE boundaries, so a range that starts on the line holding
+# the question header carries that header into the answer. Exploding the tables
+# took this from 15% of extractions to 9%; the rest is deterministic text, so
+# strip it in code rather than asking the prompt again.
+_QUESTION_LEAD = re.compile(
+    r"""^\s*
+    (?:\#+\s*)?                                   # stray markdown heading
+    (?:DETAILS\ OF\ THE\ INVENTION\s*)?           # section banner
+    (?:</?t[dr][^>]*>|</?table[^>]*>|\s)*     # table scaffolding
+    (?:\d{1,2}\.\s*)?                             # question number
+    (?:Overview|Novelty\s*&\s*Unobviousness|Novelty|Limitations|
+       Prior\s*Art|Commercial\s*Applications|Plans|Technical\s*Description|
+       Material|Technology\s*Readiness\s*Level)
+    \s*[-–—]\s*[^:]{0,400}?(?::|etc\.)\s*             # template prompt, to ":" or "etc."
+    """,
+    re.X | re.I,
+)
+
+
+def _trim_lead(s: str) -> str:
+    """Drop a leading question header that the line range swept in."""
+    for _ in range(2):  # banner + question can both be present
+        new = _QUESTION_LEAD.sub("", s, count=1).lstrip()
+        if new == s:
+            break
+        s = new
+    # A line range can also start PART-WAY through the question text, leaving a
+    # lowercase fragment ending in the question's colon ("commercial problems
+    # this invention solves: ..."). Requiring a lowercase start and no sentence
+    # punctuation before the colon keeps real answers (which start with a
+    # capital, or carry no colon at all) untouched.
+    s = re.sub(r"^[a-z][^.!?\n]{0,150}?:\s+", "", s)
+    # leftover table scaffolding at either end
+    s = re.sub(r"^(?:</?t[dr][^>]*>|</?table[^>]*>|\s)+", "", s)
+    return re.sub(r"(?:</?t[dr][^>]*>|</?table[^>]*>|\s)+$", "", s).strip()
 
 
 def _n(v):
@@ -565,20 +757,20 @@ def assemble(doc: dict) -> dict:
         "date_of_submission": _n(doc.get("date_of_submission")),
         "title": _n(doc.get("title")),
         "field_of_invention": [x for x in (doc.get("field_of_invention") or []) if _n(x)],
-        "summary": _n(doc.get("body_extracted_summary")),
+        "summary": _n(_trim_lead(doc.get("body_extracted_summary") or "")),
         "background": _n(doc.get("background")),
-        "detailed_description": _n(doc.get("body_extracted_technical")),
-        "novelty_and_advantages": _n(doc.get("novelty_and_advantages")),
-        "problem_solved": _n(doc.get("commercial_applications")),
-        "commercial_applications": _n(doc.get("commercial_applications")),
+        "detailed_description": _n(_trim_lead(doc.get("body_extracted_technical") or "")),
+        "novelty_and_advantages": _n(_trim_lead(doc.get("body_extracted_novelty") or "")),
+        "problem_solved": _n(_trim_lead(doc.get("body_extracted_commercial") or "")),
+        "commercial_applications": _n(_trim_lead(doc.get("body_extracted_commercial") or "")),
         "industrial_applications": _n(doc.get("industrial_applications")),
-        "limitations": _n(doc.get("limitations")),
-        "prior_art": _n(doc.get("body_extracted_prior_art")),
+        "limitations": _n(_trim_lead(doc.get("body_extracted_limitations") or "")),
+        "prior_art": _n(_trim_lead(doc.get("body_extracted_prior_art") or "")),
         "cited_prior_art_references": [
             x for x in (doc.get("cited_prior_art_references") or []) if _n(x)
         ],
         "modifications": _n(doc.get("modifications")),
-        "plans": _n(doc.get("plans")),
+        "plans": _n(_trim_lead(doc.get("body_extracted_plans") or "")),
         "drawings_description": _n(doc.get("drawings_description")),
         "literature_references": [
             x for x in (doc.get("literature_references") or []) if _n(x)
