@@ -1,0 +1,22 @@
+# Source documents and extraction outputs are NOT committed.
+#
+# This repo's `origin` is the public upstream github.com/ucbepic/docetl.
+# These files carry inventor names, NUS emails, phone numbers, home
+# addresses, staff/student numbers, handwritten signature images, and
+# unpublished pre-filing invention disclosures. None of that belongs in a
+# repository that can be pushed to a public remote.
+#
+# Only the pipeline/report code in this directory is tracked.
+
+samples/
+samples_pdf/
+Converted-MD-Hybrid-Engine/
+extraction */
+LLM-Judge */
+Report/
+*.xlsx
+ab_multimodal_results.json
+invention_disclosure.json
+invention_disclosure.py
+__pycache__/
+.DS_Store

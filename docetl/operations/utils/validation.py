@@ -154,7 +154,11 @@ def convert_val(value: Any, model: str = "gpt-4o-mini") -> dict[str, Any]:
         properties = {}
         for item in value[1:-1].split(","):
             key, val = item.strip().split(":")
-            properties[key.strip()] = convert_val(val.strip(), model)
+            # Keys may be written quoted ("{'start_line': int}"); the quotes are
+            # notation, not part of the field name. Leaving them in produces a
+            # schema whose properties are literally named "'start_line'", which
+            # a structured-output model reproduces verbatim.
+            properties[key.strip().strip("\"'")] = convert_val(val.strip(), model)
         result = {
             "type": "object",
             "properties": properties,
