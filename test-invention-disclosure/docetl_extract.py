@@ -67,6 +67,14 @@ docetl.rate_limits = {
 # in convert_val) whose cache key does not change when the bug is fixed.
 BYPASS_EXTRACT = os.environ.get("IDF_BYPASS_EXTRACT", "0") == "1"
 
+# Two ideas MOAR found that hand-tuning missed (its pipeline_gemini_9 scored
+# 97.1% grounding at the baseline's 53.7% coverage, where the baseline grounded
+# 95.1%): a verbatim compression pass in front of everything else, and pinning
+# temperature to 0.
+COMPRESS = os.environ.get("IDF_COMPRESS", "0") == "1"
+TEMP0 = os.environ.get("IDF_TEMP0", "0") == "1"
+LLM_KW = {"temperature": 0} if TEMP0 else {}
+
 GROUNDING = """
 GROUNDING RULE (applies to every field): populate a field ONLY from text
 physically present in THIS form. If a section is blank, filled with
@@ -100,6 +108,11 @@ def load_docs() -> list[dict]:
 # parameter, so the verbatim ops stay markdown-only by construction.
 def _vision(**kw):
     return {"pdf_url_key": "pdf_path", "skip_on_error": True, **kw} if USE_PDF else kw
+
+
+def _llm(**kw):
+    """Shared per-op LLM settings. temperature=0 makes reruns comparable."""
+    return {"litellm_completion_kwargs": LLM_KW, **kw} if LLM_KW else kw
 
 
 # ── 2. preprocess (deterministic, no LLM) ──────────────────────────
@@ -220,6 +233,22 @@ def strip_boilerplate(doc: dict) -> dict:
     return out
 
 
+def adopt_compressed(doc: dict) -> dict:
+    """Swap the compressed text in as `body`, unless it looks lossy.
+
+    A compression that returns less than half the document is more likely to
+    have dropped a filled answer than to have found that much boilerplate, so
+    fall back to the full text. `_compressed_to` records what happened.
+    """
+    full = doc["body"]
+    comp = doc.get("body_extracted_compress") or ""
+    use = comp if len(comp) >= 0.5 * len(full) else full
+    out = dict(doc)
+    out["body"] = use
+    out["_compressed_to"] = round(len(use) / max(len(full), 1), 3)
+    return out
+
+
 # ── 3. extraction ops ──────────────────────────────────────────────
 
 def build(frame: docetl.Frame, *, preprocess: bool = True) -> docetl.Frame:
@@ -235,10 +264,45 @@ def build(frame: docetl.Frame, *, preprocess: bool = True) -> docetl.Frame:
     if preprocess:
         frame = frame.code_map(name="preprocess", code=strip_boilerplate)
 
+    if COMPRESS:
+        # One verbatim compression pass shared by every downstream op, rather
+        # than 12 per-op slices. The per-op slicing experiment failed because
+        # a narrow fragment strips the context the model needs to locate
+        # boundaries; a single coherent-but-shorter document does not.
+        # `extract` keeps this lossless-by-construction: the model emits line
+        # ranges and code slices them, so compression cannot reword anything.
+        frame = frame.extract(
+            name="compress",
+            prompt="""Extract every part of this Invention Disclosure Form that
+carries filled-in content, and omit the blank template scaffolding.
+
+KEEP: the form's own title/instruction headers that identify its generation
+(the "For ILO/TTI use only" box, the submission mailbox); the Title of the
+Invention; Section I grants and contractual obligations; Section II public
+disclosure; the III-A and III-B inventor tables IN FULL including the
+Signature row; and every answer body in Section IV -- Overview, Novelty &
+Unobviousness with its table, Limitations, Prior Art, Commercial
+Applications, Commercial Interest, Plans, Technology Readiness Level,
+Material, and the complete Technical Description with its sub-headings,
+figure captions, tables, equations, reference list and any proposed claims.
+
+OMIT: the multi-paragraph consent and assignment legalese, and the printed
+menu of ~20 numbered funding agencies (keep only the lines showing which
+agency was actually selected).
+
+When in doubt, KEEP the text. Omitting a filled answer is far worse than
+keeping some boilerplate.""",
+            document_keys=["body"],
+            skip_on_error=True,
+            **_llm(),
+            bypass_cache=BYPASS_EXTRACT,
+        )
+        frame = frame.code_map(name="use_compressed", code=adopt_compressed)
+
     # --- 3a. form identity / metadata -------------------------------
     frame = frame.map(
         name="meta",
-        **_vision(),
+        **_vision(), **_llm(),
         prompt=GROUNDING
         + """
 
@@ -291,7 +355,7 @@ Field notes:
     # --- 3b. inventors (transposed table) ---------------------------
     frame = frame.map(
         name="inventors",
-        **_vision(),
+        **_vision(), **_llm(),
         prompt=GROUNDING
         + """
 
@@ -342,7 +406,7 @@ Rules:
     # --- 3c. grants, materials, disclosure, commercial interest -----
     frame = frame.map(
         name="obligations",
-        **_vision(),
+        **_vision(), **_llm(),
         prompt=GROUNDING
         + """
 
@@ -408,6 +472,7 @@ public_disclosure -- the two-row table, Q4 and Q5.
     # --- 3d. references / claims / approvals ------------------------
     frame = frame.map(
         name="refs",
+        **_llm(),
         prompt=GROUNDING
         + """
 
@@ -465,6 +530,7 @@ manufacturing"). [] if not explicitly stated.""",
     # cannot be shortened or reworded by the model.
     frame = frame.map(
         name="narrative",
+        **_llm(),
         prompt=GROUNDING
         + """
 
@@ -509,6 +575,7 @@ not include the following question. If the answer is blank or only
 "Write here...", extract nothing.""",
         document_keys=["body"],
         skip_on_error=True,
+        **_llm(),
         bypass_cache=BYPASS_EXTRACT,
     )
 
@@ -525,6 +592,7 @@ next numbered question. NOTE: the oldest v3-era forms have no Prior Art
 question at all -- if there is none, extract nothing.""",
         document_keys=["body"],
         skip_on_error=True,
+        **_llm(),
         bypass_cache=BYPASS_EXTRACT,
     )
 
@@ -542,6 +610,7 @@ question ("Limitations"). Do not include the question text itself. If the
 table is empty or only placeholder text, extract nothing.""",
         document_keys=["body"],
         skip_on_error=True,
+        **_llm(),
         bypass_cache=BYPASS_EXTRACT,
     )
 
@@ -557,6 +626,7 @@ Extract the full answer body only, stopping before the next numbered question
 blank, "NA", or only placeholder text, extract nothing.""",
         document_keys=["body"],
         skip_on_error=True,
+        **_llm(),
         bypass_cache=BYPASS_EXTRACT,
     )
 
@@ -572,6 +642,7 @@ stopping before the next numbered question. Do not include the question text
 itself. If blank or "NA", extract nothing.""",
         document_keys=["body"],
         skip_on_error=True,
+        **_llm(),
         bypass_cache=BYPASS_EXTRACT,
     )
 
@@ -587,6 +658,7 @@ Extract the full answer body only, stopping before the next numbered question
 blank or "NA", extract nothing.""",
         document_keys=["body"],
         skip_on_error=True,
+        **_llm(),
         bypass_cache=BYPASS_EXTRACT,
     )
 
@@ -604,6 +676,7 @@ the end, and any "Proposed Claims:" block. Do not stop early -- this answer
 often runs for many pages. Do not include the question text itself.""",
         document_keys=["body"],
         skip_on_error=True,
+        **_llm(),
         bypass_cache=BYPASS_EXTRACT,
     )
 
